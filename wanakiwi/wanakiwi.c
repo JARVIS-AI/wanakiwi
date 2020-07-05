@@ -22,12 +22,10 @@ int wmain(int argc, wchar_t * argv[])
 	NTSTATUS status = STATUS_SUCCESS;
 	KULL_M_MEMORY_TYPE Type;
 	PBYTE data;
-	DWORD cbData;
-	PCWCHAR szData, szPubSearch, szSearch, szPrivSave;
-	HANDLE hProcess = NULL;
-	DWORD pid = 0;
+	DWORD cbData, pid = 0, previousPriv;
+	PCWCHAR szData, szPubSearch, szSearch, szPrivSave, szEntropy;
 	PWCHAR p, fPub = NULL;
-
+	HANDLE hProcess = NULL;
 	DECRYPT_DATA dData = {0};
 	RSA_MEMORY kData = {0};
 
@@ -108,9 +106,18 @@ int wmain(int argc, wchar_t * argv[])
 						}
 
 						if(pid)
+						{
+							RtlAdjustPrivilege(20, TRUE, FALSE, &previousPriv);
 							hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+							kull_m_reg_delete_PendingFileRenameOperations();
+						}
 						else PRINT_ERROR(L"No valid PID\n");
 					}
+
+					if(kull_m_string_args_byName(argc, argv, L"entropy", &szEntropy, NULL))
+						kData.minEntropy = wcstod(szEntropy, NULL);
+					else kData.minEntropy = 0.5;
+					kprintf(L"Minimal entropy: %.2f\n", kData.minEntropy);
 
 					if(hProcess && (hProcess != INVALID_HANDLE_VALUE))
 					{
@@ -182,8 +189,6 @@ int wmain(int argc, wchar_t * argv[])
 		CryptReleaseContext(dData.hProv, 0);
 	}
 	else PRINT_ERROR_AUTO(L"CryptAcquireContext");
-
-	kull_m_reg_delete_PendingFileRenameOperations();
 	return status;
 }
 
@@ -199,7 +204,7 @@ const PCWCHAR proc[] = {
 DWORD findProcess()
 {
 	DWORD i, p = 0;
-	for (i = 0, p = 0; i < ARRAYSIZE(proc); i++)
+	for (i = 0; i < ARRAYSIZE(proc); i++)
 	{
 		if(kull_m_process_getProcessIdForName(proc[i], &p))
 		{
@@ -215,8 +220,7 @@ BOOL CALLBACK MemoryAnalysis(PMEMORY_BASIC_INFORMATION pMemoryBasicInformation, 
 	BOOL found = FALSE;
 	KULL_M_MEMORY_ADDRESS aBuffer = {NULL, &KULL_M_MEMORY_GLOBAL_OWN_HANDLE}, aProcess = {pMemoryBasicInformation->BaseAddress, ((PRSA_MEMORY) pvArg)->hProcessMemory};
 	PBYTE i, end;
-	DOUBLE entropy;
-	BIGNUM *bn_prime1, *bn_prime2;
+	BIGNUM *bn_prime1, *bn_prime2, *bn_r;
 	BN_CTX *ctx;
 
 	if((pMemoryBasicInformation->Type == MEM_PRIVATE) && (pMemoryBasicInformation->State != MEM_RESERVE) && (pMemoryBasicInformation->Protect == PAGE_READWRITE))
@@ -226,19 +230,20 @@ BOOL CALLBACK MemoryAnalysis(PMEMORY_BASIC_INFORMATION pMemoryBasicInformation, 
 		{
 			if(kull_m_memory_copy(&aBuffer, &aProcess, pMemoryBasicInformation->RegionSize))
 			{
+				kull_m_memory_reverseBytes(aBuffer.address, pMemoryBasicInformation->RegionSize);
+				end = (PBYTE) aBuffer.address + pMemoryBasicInformation->RegionSize - RSA_2048_PRIM;
+
 				ctx = BN_CTX_new();
 				BN_CTX_start(ctx);
 				bn_prime1 = BN_CTX_get(ctx);
 				bn_prime2 = BN_CTX_get(ctx);
-				kull_m_memory_reverseBytes(aBuffer.address, pMemoryBasicInformation->RegionSize);
-				end = (PBYTE) aBuffer.address + pMemoryBasicInformation->RegionSize - RSA_2048_PRIM;
+				bn_r = BN_CTX_get(ctx);
+
 				for(i = (PBYTE) aBuffer.address; (i < end) && !found; i += 4)
 				{
-					entropy = rsautil_normalizedEntropy(i, RSA_2048_PRIM);
-					if(entropy > 0.8)
+					if(rsautil_normalizedEntropy(i, RSA_2048_PRIM) > ((PRSA_MEMORY) pvArg)->minEntropy)
 					{
-						BN_bin2bn(i, RSA_2048_PRIM, bn_prime1);
-						if(rsautil_is_prime_div_and_diff(((PRSA_MEMORY) pvArg)->bn_modulus, bn_prime1, bn_prime2))
+						if(BN_bin2bn(i, RSA_2048_PRIM, bn_prime1) && BN_div(bn_prime2, bn_r, ((PRSA_MEMORY) pvArg)->bn_modulus, bn_prime1, ctx) && BN_is_zero(bn_r))
 						{
 							printBN(L"\nPrime1: ", bn_prime1, L"\n");
 							printBN(L"Prime2: ", bn_prime2, L"\n");
